@@ -7,6 +7,8 @@ project('suterusu', 'cpp',
   ]
 )
 
+meson.add_install_script('scripts/copy_deps.py')
+
 # Find dependencies
 curl_dep = dependency('libcurl', required: true)
 nlohmann_json_dep = dependency('nlohmann_json', required: true)
@@ -27,8 +29,9 @@ executable('suterusu',
   sources,
   dependencies: [curl_dep, nlohmann_json_dep],
   win_subsystem: 'windows',  # Hide console by default (use --debug to show)
+  install_dir: meson.current_source_dir() + '/bin',
   install: true
 )
 
 # Install config example
-install_data('config.json', install_dir: get_option('bindir'))
+install_data('config.json', install_dir: meson.current_source_dir() + '/bin')
