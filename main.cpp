@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
+#include "overlay.h"
 
 using json = nlohmann::json;
 
@@ -358,6 +359,25 @@ void InitializeCurl()
     std::cout << "[DEBUG] Initialized persistent CURL handle with low-latency optimizations" << std::endl;
 }
 
+// Extract content between specified tags
+std::string ExtractTag(const std::string& text, const std::string& tag) {
+    std::string openTag = "<" + tag + ">";
+    std::string closeTag = "</" + tag + ">";
+    
+    size_t startPos = text.find(openTag);
+    size_t endPos = text.find(closeTag);
+
+    // If both open and close tags are found, extract content between them
+    if (startPos != std::string::npos && endPos != std::string::npos && endPos > startPos) {
+        startPos += openTag.length();
+        return text.substr(startPos, endPos - startPos);
+    }
+    
+    // Fallback to return the whole text if tags are not found
+    return text; 
+}
+
+// Send text to OpenAI API
 std::string SendToAPI(const std::string &prompt)
 {
     std::lock_guard<std::mutex> curlLock(curlMutex);
@@ -443,13 +463,16 @@ std::string SendToAPI(const std::string &prompt)
         if (responseJson.contains("choices") && !responseJson["choices"].empty())
         {
             std::string content = responseJson["choices"][0]["message"]["content"];
+            // Assume the answer is wrapped in <answer> tags
+            // User should specify this in the system prompt
+            std::string finalAnswer = ExtractTag(content, "answer");
             {
                 std::lock_guard<std::mutex> lock(historyMutex);
                 chatHistory.push_back({{"role", "user"}, {"content", prompt}});
                 chatHistory.push_back({{"role", "assistant"}, {"content", content}});
                 std::cout << "[DEBUG] Added conversation to history. Total messages: " << chatHistory.size() << std::endl;
             }
-            return content;
+            return finalAnswer;
         }
         else if (responseJson.contains("error"))
             return "API Error: " + responseJson["error"]["message"].get<std::string>();
@@ -518,7 +541,7 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
             std::cout << "No response available." << std::endl;
         break;
     }
-    case VK_F9:
+    case VK_F12:
         programRunning = false;
         PostQuitMessage(0);
         break;
@@ -620,7 +643,7 @@ int main(int argc, char *argv[])
     std::cout << "  F6 - Clear chat history" << std::endl;
     std::cout << "  F7 - Read clipboard and send to API" << std::endl;
     std::cout << "  F8 - Replace clipboard with API response" << std::endl;
-    std::cout << "  F9 - Quit application" << std::endl;
+    std::cout << "  F12 - Quit application" << std::endl;
     std::cout << std::endl;
     
     // Initialize CURL before showing ready message
