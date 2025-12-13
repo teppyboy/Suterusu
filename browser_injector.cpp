@@ -108,6 +108,25 @@ private:
             
             connected = true;
             std::cout << "[CDP] WebSocket connection established\n";
+            
+            // Enable Page domain (required for addScriptToEvaluateOnNewDocument)
+            try {
+                json enable_msg = {
+                    {"id", message_id++},
+                    {"method", "Page.enable"},
+                    {"params", json::object()}
+                };
+                
+                std::string enable_text = enable_msg.dump();
+                ws->write(boost::asio::buffer(enable_text));
+                
+                boost::beast::flat_buffer enable_buffer;
+                ws->read(enable_buffer);
+                std::cout << "[CDP] Page domain enabled\n";
+            } catch (...) {
+                std::cerr << "[CDP] Warning: Could not enable Page domain\n";
+            }
+            
             return true;
             
         } catch (std::exception const &e) {
@@ -192,6 +211,7 @@ public:
 // Global persistent connection
 static std::unique_ptr<CDPConnection> g_cdp_connection;
 static std::mutex g_cdp_mutex;
+static std::string g_last_script_id; // Store script ID for removal
 
 extern "C" __declspec(dllexport) bool InitializeCDP() {
     std::lock_guard<std::mutex> lock(g_cdp_mutex);
@@ -238,20 +258,46 @@ extern "C" __declspec(dllexport) bool InjectJavaScript(const char* filename)
                           std::istreambuf_iterator<char>()};
         jsFile.close();
         
-        // Send Runtime.evaluate command
-        json params = {
+        // Remove previous script if exists
+        if (!g_last_script_id.empty()) {
+            json remove_params = {{"identifier", g_last_script_id}};
+            std::string remove_response;
+            g_cdp_connection->SendCommand("Page.removeScriptToEvaluateOnNewDocument", remove_params, remove_response);
+            std::cout << "[CDP] Removed previous script\n";
+            g_last_script_id.clear();
+        }
+        
+        // Use Page.addScriptToEvaluateOnNewDocument for persistent injection
+        json params = {{"source", jsCode}};
+        
+        std::string response;
+        if (!g_cdp_connection->SendCommand("Page.addScriptToEvaluateOnNewDocument", params, response)) {
+            std::cerr << "[CDP] Failed to add script\n";
+            return false;
+        }
+        
+        // Parse response to get script ID
+        try {
+            auto resp_json = json::parse(response);
+            if (resp_json.contains("result") && resp_json["result"].contains("identifier")) {
+                g_last_script_id = resp_json["result"]["identifier"].get<std::string>();
+                std::cout << "[CDP] Script registered (ID: " << g_last_script_id << ")\n";
+            }
+        } catch (...) {
+            std::cout << "[CDP] Script registered (ID unknown)\n";
+        }
+        
+        // Also evaluate immediately on current page
+        json eval_params = {
             {"expression", jsCode},
             {"userGesture", true},
             {"awaitPromise", false}
         };
         
-        std::string response;
-        if (!g_cdp_connection->SendCommand("Runtime.evaluate", params, response)) {
-            std::cerr << "[CDP] Failed to send command\n";
-            return false;
-        }
+        std::string eval_response;
+        g_cdp_connection->SendCommand("Runtime.evaluate", eval_params, eval_response);
         
-        std::cout << "[CDP] Response: " << response << "\n";
+        std::cout << "[CDP] Script will auto-inject on page load/navigation\n";
         return true;
         
     } catch (std::exception const &e) {
