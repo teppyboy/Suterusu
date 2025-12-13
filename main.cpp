@@ -15,6 +15,9 @@
 
 using json = nlohmann::json;
 
+// CDP injector DLL function
+extern "C" __declspec(dllimport) bool InjectJavaScript(const char* filename);
+
 HHOOK hKeyboardHook;
 std::string apiResponse;
 std::mutex responseMutex;
@@ -28,6 +31,7 @@ std::mutex historyMutex;
 std::string API_URL;
 std::string API_KEY;
 std::string MODEL;
+std::vector<std::string> FALLBACK_MODELS; // Array of fallback models for automatic failover
 std::vector<std::string> AI_PROVIDERS; // Array of provider names for OpenRouter routing
 std::string SYSTEM_PROMPT;
 std::string FLASH_WINDOW = "Chrome";
@@ -80,6 +84,9 @@ void FlashWindow(HWND hwnd)
 
 BOOL CALLBACK EnumWindowsCallback(HWND hwnd, LPARAM lParam)
 {
+    // Pretend to use lParam to suppress unused parameter warning
+    (void)lParam;
+
     // Skip invisible windows early
     if (!IsWindowVisible(hwnd))
         return TRUE;
@@ -178,7 +185,8 @@ bool LoadConfig()
             {"api_url", "http://localhost:8080/v1/chat/completions"},
             {"api_key", ""},
             {"ai", {
-                {"model", "gpt-3.5-turbo"},
+                {"model", "openai/gpt-3.5-turbo"},
+                {"fallback_models", json::array()},
                 {"providers", json::array()}
             }},
             {"flash_window", "Chrome"}
@@ -214,6 +222,18 @@ bool LoadConfig()
             return false;
         }
         MODEL = aiConfig["model"];
+        
+        // Parse fallback_models array (optional)
+        if (aiConfig.contains("fallback_models") && aiConfig["fallback_models"].is_array())
+        {
+            for (const auto& fallbackModel : aiConfig["fallback_models"])
+            {
+                if (fallbackModel.is_string())
+                    FALLBACK_MODELS.push_back(fallbackModel.get<std::string>());
+            }
+            if (!FALLBACK_MODELS.empty())
+                std::cout << "[DEBUG] Loaded " << FALLBACK_MODELS.size() << " fallback model(s)" << std::endl;
+        }
         
         // Parse providers array (optional)
         if (aiConfig.contains("providers") && aiConfig["providers"].is_array())
@@ -355,7 +375,11 @@ void InitializeCurl()
     
     // Use HTTP pipelining for better performance
     curl_easy_setopt(persistentCurl, CURLOPT_PIPEWAIT, 1L);
-    
+
+    /* Tells libcurl to use standard certificate store of operating system.
+       Currently implemented under MS-Windows. */
+    curl_easy_setopt(persistentCurl, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
+
     std::cout << "[DEBUG] Initialized persistent CURL handle with low-latency optimizations" << std::endl;
 }
 
@@ -412,12 +436,25 @@ std::string SendToAPI(const std::string &prompt)
     }
     messages.push_back({{"role", "user"}, {"content", prompt}});
     
-    // Build payload with optional provider routing
+    // Build payload with optional provider routing and model fallbacks
     json payload = {
         {"model", MODEL}, 
         {"messages", messages}, 
         {"temperature", 0.7}
     };
+    
+    // Add model fallbacks if specified (for OpenRouter automatic failover)
+    if (!FALLBACK_MODELS.empty())
+    {
+        // Build fallback models array
+        json modelsArray = json::array();
+        for (const auto& fallbackModel : FALLBACK_MODELS)
+        {
+            modelsArray.push_back(fallbackModel);
+        }
+        payload["models"] = modelsArray;
+        std::cout << "[DEBUG] Including model fallbacks: " << modelsArray.dump() << std::endl;
+    }
     
     // Add provider routing if providers are specified (for OpenRouter)
     if (!AI_PROVIDERS.empty())
@@ -509,6 +546,9 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
             std::cout << "Clipboard empty." << std::endl;
             break;
         }
+        // Show green indicator when clipboard read succeeds and sending to API
+        ShowOverlayIndicator(700, IndicatorColor::Green);
+        
         std::lock_guard<std::mutex> lock(threadMutex);
         if (apiThread.joinable())
             apiThread.join();
@@ -522,6 +562,9 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
                 apiResponse = response;
                 responseReady = true;
                 std::cout << "Response received. Press F8 to copy." << std::endl;
+                // Show green indicator with first character of response
+                const char* firstChar = response.empty() ? nullptr : response.c_str();
+                ShowOverlayIndicator(3000, IndicatorColor::Green, firstChar);
                 FlashConfiguredWindows();
             }
             catch (...) { std::cerr << "Error in API thread." << std::endl; }
@@ -534,13 +577,43 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
         std::lock_guard<std::mutex> lock(responseMutex);
         if (responseReady && !apiResponse.empty())
         {
-            std::cout << (SetClipboardText(apiResponse) ? "Clipboard updated." : "Failed to update clipboard.") << std::endl;
+            if (SetClipboardText(apiResponse))
+            {
+                std::cout << "Clipboard updated." << std::endl;
+                // Show green indicator on successful clipboard update
+                const char* firstChar = apiResponse.empty() ? nullptr : apiResponse.c_str();
+                ShowOverlayIndicator(1000, IndicatorColor::Green, firstChar);
+            }
+            else
+            {
+                std::cout << "Failed to update clipboard." << std::endl;
+            }
             responseReady = false;
         }
         else
+        {
             std::cout << "No response available." << std::endl;
+            // Show red indicator when no response is available
+            ShowOverlayIndicator(1000, IndicatorColor::Red);
+        }
         break;
     }
+    case VK_F9:
+    {
+        std::cout << "F9 pressed - Toggling Selection Highlighting..." << std::endl;
+        if (InjectJavaScript("js/toggle_selection.js"))
+        {
+            std::cout << "[DEBUG] JavaScript injection successful!" << std::endl;
+            ShowOverlayIndicator(1000, IndicatorColor::Green);
+        }
+        else
+        {
+            std::cout << "[DEBUG] JavaScript injection failed!" << std::endl;
+            ShowOverlayIndicator(1000, IndicatorColor::Red);
+        }
+        break;
+    }
+    // Use F12 to quit the application to prevent accidental closure
     case VK_F12:
         programRunning = false;
         PostQuitMessage(0);
@@ -624,6 +697,17 @@ int main(int argc, char *argv[])
     std::cout << "Configuration loaded successfully:" << std::endl;
     std::cout << "  API URL: " << API_URL << std::endl;
     std::cout << "  Model: " << MODEL << std::endl;
+    if (!FALLBACK_MODELS.empty())
+    {
+        std::cout << "  Fallback Models: ";
+        for (size_t i = 0; i < FALLBACK_MODELS.size(); ++i)
+        {
+            std::cout << FALLBACK_MODELS[i];
+            if (i < FALLBACK_MODELS.size() - 1)
+                std::cout << ", ";
+        }
+        std::cout << std::endl;
+    }
     if (!AI_PROVIDERS.empty())
     {
         std::cout << "  Providers: ";
@@ -643,6 +727,7 @@ int main(int argc, char *argv[])
     std::cout << "  F6 - Clear chat history" << std::endl;
     std::cout << "  F7 - Read clipboard and send to API" << std::endl;
     std::cout << "  F8 - Replace clipboard with API response" << std::endl;
+    std::cout << "  F9 - Toggle text selection" << std::endl;
     std::cout << "  F12 - Quit application" << std::endl;
     std::cout << std::endl;
     
