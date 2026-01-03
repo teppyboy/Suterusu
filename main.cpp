@@ -9,6 +9,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cstdio>
+#include <queue>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include "overlay.h"
@@ -21,12 +22,10 @@ extern "C" __declspec(dllimport) void ShutdownCDP();
 extern "C" __declspec(dllimport) bool InjectJavaScript(const char* filename);
 
 HHOOK hKeyboardHook;
-std::string apiResponse;
+std::queue<std::string> responseQueue;
 std::mutex responseMutex;
-bool responseReady = false;
 std::atomic<int> activeThreads(0);
 std::atomic<bool> programRunning(true);
-std::thread apiThread;
 std::mutex threadMutex;
 json chatHistory = json::array();
 std::mutex historyMutex;
@@ -551,19 +550,22 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
         // Show green indicator when clipboard read succeeds and sending to API
         ShowOverlayIndicator(700, IndicatorColor::Green);
         
-        std::lock_guard<std::mutex> lock(threadMutex);
-        if (apiThread.joinable())
-            apiThread.join();
-        apiThread = std::thread([clipboardText]()
+        // Launch thread for API request
+        std::thread([clipboardText]()
         {
             activeThreads++;
             try
             {
                 std::string response = SendToAPI(clipboardText);
+
+                // Add response to queue
+                {
                 std::lock_guard<std::mutex> lock(responseMutex);
-                apiResponse = response;
-                responseReady = true;
-                std::cout << "Response received. Press F8 to copy." << std::endl;
+                    responseQueue.push(response);
+                    std::cout << "Response queued. Press F8 to copy ("
+                    << responseQueue.size() << " pending)." << std::endl;
+                }
+                
                 // Show green indicator with first character of response
                 const char* firstChar = response.empty() ? nullptr : response.c_str();
                 ShowOverlayIndicator(3000, IndicatorColor::Green, firstChar);
@@ -571,19 +573,24 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
             }
             catch (...) { std::cerr << "Error in API thread." << std::endl; }
             activeThreads--;
-        });
+        }).detach();
         break;
     }
     case VK_F8:
     {
         std::lock_guard<std::mutex> lock(responseMutex);
-        if (responseReady && !apiResponse.empty())
+        if (!responseQueue.empty())
         {
-            if (SetClipboardText(apiResponse))
+            std::string response = responseQueue.front();
+            responseQueue.pop();
+            
+            std::cout << "Popped oldest response from queue. " << responseQueue.size() << " response(s) remaining" << std::endl;
+            
+            if (SetClipboardText(response))
             {
                 std::cout << "Clipboard updated." << std::endl;
                 // Show green indicator on successful clipboard update
-                const char* firstChar = apiResponse.empty() ? nullptr : apiResponse.c_str();
+                const char* firstChar = response.empty() ? nullptr : response.c_str();
                 ShowOverlayIndicator(1000, IndicatorColor::Green, firstChar);
             }
             else
